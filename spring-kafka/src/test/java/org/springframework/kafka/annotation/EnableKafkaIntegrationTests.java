@@ -36,6 +36,7 @@ import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.event.EventListener;
 import org.springframework.context.support.PropertySourcesPlaceholderConfigurer;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.config.KafkaListenerContainerFactory;
@@ -45,10 +46,15 @@ import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
+import org.springframework.kafka.event.ListenerContainerIdleEvent;
 import org.springframework.kafka.listener.AbstractMessageListenerContainer.AckMode;
 import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 import org.springframework.kafka.listener.MessageListenerContainer;
-import org.springframework.kafka.listener.adapter.DeDuplicationStrategy;
+import org.springframework.kafka.listener.adapter.FilteringAcknowledgingMessageListenerAdapter;
+import org.springframework.kafka.listener.adapter.MessagingMessageListenerAdapter;
+import org.springframework.kafka.listener.adapter.RecordFilterStrategy;
+import org.springframework.kafka.listener.adapter.RetryingAcknowledgingMessageListenerAdapter;
+import org.springframework.kafka.listener.config.ContainerProperties;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.kafka.support.converter.StringJsonMessageConverter;
@@ -57,6 +63,9 @@ import org.springframework.kafka.test.utils.KafkaTestUtils;
 import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.retry.RecoveryCallback;
+import org.springframework.retry.RetryContext;
+import org.springframework.retry.support.RetryTemplate;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.junit4.SpringJUnit4ClassRunner;
@@ -98,31 +107,46 @@ public class EnableKafkaIntegrationTests {
 	public KafkaListenerEndpointRegistry registry;
 
 	@Autowired
-	private DeDupImpl deDup;
+	private RecordFilterImpl recordFilter;
 
 	@Test
 	public void testSimple() throws Exception {
 		template.send("annotated1", 0, "foo");
 		template.flush();
-		assertThat(this.listener.latch1.await(10, TimeUnit.SECONDS)).isTrue();
+		assertThat(this.listener.latch1.await(20, TimeUnit.SECONDS)).isTrue();
 
 		template.send("annotated2", 0, 123, "foo");
 		template.flush();
-		assertThat(this.listener.latch2.await(10, TimeUnit.SECONDS)).isTrue();
+		assertThat(this.listener.latch2.await(20, TimeUnit.SECONDS)).isTrue();
 		assertThat(this.listener.key).isEqualTo(123);
 		assertThat(this.listener.partition).isNotNull();
 		assertThat(this.listener.topic).isEqualTo("annotated2");
 
 		template.send("annotated3", 0, "foo");
 		template.flush();
-		assertThat(this.listener.latch3.await(10, TimeUnit.SECONDS)).isTrue();
+		assertThat(this.listener.latch3.await(20, TimeUnit.SECONDS)).isTrue();
 		assertThat(this.listener.record.value()).isEqualTo("foo");
 
 		template.send("annotated4", 0, "foo");
 		template.flush();
-		assertThat(this.listener.latch4.await(10, TimeUnit.SECONDS)).isTrue();
+		assertThat(this.listener.latch4.await(20, TimeUnit.SECONDS)).isTrue();
 		assertThat(this.listener.record.value()).isEqualTo("foo");
 		assertThat(this.listener.ack).isNotNull();
+		assertThat(this.listener.eventLatch.await(20, TimeUnit.SECONDS)).isTrue();
+		assertThat(this.listener.event.getListenerId().startsWith("qux-"));
+		MessageListenerContainer manualContainer = this.registry.getListenerContainer("qux");
+		assertThat(KafkaTestUtils.getPropertyValue(manualContainer, "containerProperties.messageListener"))
+				.isInstanceOf(FilteringAcknowledgingMessageListenerAdapter.class);
+		assertThat(KafkaTestUtils.getPropertyValue(manualContainer, "containerProperties.messageListener.ackDiscarded",
+				Boolean.class)).isTrue();
+		assertThat(KafkaTestUtils.getPropertyValue(manualContainer, "containerProperties.messageListener.delegate"))
+				.isInstanceOf(RetryingAcknowledgingMessageListenerAdapter.class);
+		assertThat(KafkaTestUtils
+				.getPropertyValue(manualContainer, "containerProperties.messageListener.delegate.recoveryCallback")
+				.getClass().getName()).contains("EnableKafkaIntegrationTests$Config$");
+		assertThat(KafkaTestUtils.getPropertyValue(manualContainer,
+				"containerProperties.messageListener.delegate.delegate"))
+						.isInstanceOf(MessagingMessageListenerAdapter.class);
 
 		template.send("annotated5", 0, 0, "foo");
 		template.send("annotated5", 1, 0, "bar");
@@ -133,9 +157,9 @@ public class EnableKafkaIntegrationTests {
 
 		template.send("annotated11", 0, "foo");
 		template.flush();
-		assertThat(this.listener.latch7.await(10, TimeUnit.SECONDS)).isTrue();
+		assertThat(this.listener.latch7.await(20, TimeUnit.SECONDS)).isTrue();
 
-		assertThat(this.deDup.called).isTrue();
+		assertThat(this.recordFilter.called).isTrue();
 	}
 
 	@Test
@@ -146,9 +170,12 @@ public class EnableKafkaIntegrationTests {
 		this.registry.start();
 		assertThat(listenerContainer.isRunning()).isTrue();
 		listenerContainer.stop();
-		assertThat(KafkaTestUtils.getPropertyValue(listenerContainer, "syncCommits", Boolean.class)).isFalse();
-		assertThat(KafkaTestUtils.getPropertyValue(listenerContainer, "commitCallback")).isNotNull();
-		assertThat(KafkaTestUtils.getPropertyValue(listenerContainer, "consumerRebalanceListener")).isNotNull();
+		assertThat(KafkaTestUtils.getPropertyValue(listenerContainer, "containerProperties.syncCommits", Boolean.class))
+				.isFalse();
+		assertThat(KafkaTestUtils.getPropertyValue(listenerContainer, "containerProperties.commitCallback"))
+				.isNotNull();
+		assertThat(KafkaTestUtils.getPropertyValue(listenerContainer, "containerProperties.consumerRebalanceListener"))
+				.isNotNull();
 	}
 
 	@Test
@@ -181,7 +208,7 @@ public class EnableKafkaIntegrationTests {
 				.setHeader(KafkaHeaders.PARTITION_ID, 0)
 				.setHeader(KafkaHeaders.MESSAGE_KEY, 2)
 				.build());
-		assertThat(this.listener.latch6.await(20, TimeUnit.SECONDS)).isTrue();
+		assertThat(this.listener.latch6.await(30, TimeUnit.SECONDS)).isTrue();
 		assertThat(this.listener.foo.getBar()).isEqualTo("bar");
 	}
 
@@ -206,13 +233,18 @@ public class EnableKafkaIntegrationTests {
 			ConcurrentKafkaListenerContainerFactory<Integer, String> factory =
 					new ConcurrentKafkaListenerContainerFactory<>();
 			factory.setConsumerFactory(consumerFactory());
-			factory.setDeDuplicationStrategy(deDup());
+			factory.setRecordFilterStrategy(recordFilter());
 			return factory;
 		}
 
 		@Bean
-		public DeDupImpl deDup() {
-			return new DeDupImpl();
+		public RecordFilterImpl recordFilter() {
+			return new RecordFilterImpl();
+		}
+
+		@Bean
+		public RecordFilterImpl manualFilter() {
+			return new RecordFilterImpl();
 		}
 
 		@Bean
@@ -230,7 +262,20 @@ public class EnableKafkaIntegrationTests {
 			ConcurrentKafkaListenerContainerFactory<Integer, String> factory =
 					new ConcurrentKafkaListenerContainerFactory<>();
 			factory.setConsumerFactory(manualConsumerFactory());
-			factory.setAckMode(AckMode.MANUAL_IMMEDIATE);
+			ContainerProperties props = factory.getContainerProperties();
+			props.setAckMode(AckMode.MANUAL_IMMEDIATE);
+			props.setIdleEventInterval(100L);
+			factory.setRecordFilterStrategy(manualFilter());
+			factory.setAckDiscarded(true);
+			factory.setRetryTemplate(new RetryTemplate());
+			factory.setRecoveryCallback(new RecoveryCallback<Void>() {
+
+				@Override
+				public Void recover(RetryContext context) throws Exception {
+					return null;
+				}
+
+			});
 			return factory;
 		}
 
@@ -239,11 +284,12 @@ public class EnableKafkaIntegrationTests {
 				kafkaAutoStartFalseListenerContainerFactory() {
 			ConcurrentKafkaListenerContainerFactory<Integer, String> factory =
 					new ConcurrentKafkaListenerContainerFactory<>();
+			ContainerProperties props = factory.getContainerProperties();
 			factory.setConsumerFactory(consumerFactory());
 			factory.setAutoStartup(false);
-			factory.setSyncCommits(false);
-			factory.setCommitCallback(mock(OffsetCommitCallback.class));
-			factory.setConsumerRebalanceListener(mock(ConsumerRebalanceListener.class));
+			props.setSyncCommits(false);
+			props.setCommitCallback(mock(OffsetCommitCallback.class));
+			props.setConsumerRebalanceListener(mock(ConsumerRebalanceListener.class));
 			return factory;
 		}
 
@@ -252,8 +298,9 @@ public class EnableKafkaIntegrationTests {
 				kafkaRebalanceListenerContainerFactory() {
 			ConcurrentKafkaListenerContainerFactory<Integer, String> factory =
 					new ConcurrentKafkaListenerContainerFactory<>();
+			ContainerProperties props = factory.getContainerProperties();
 			factory.setConsumerFactory(consumerFactory());
-			factory.setConsumerRebalanceListener(consumerRebalanceListener());
+			props.setConsumerRebalanceListener(consumerRebalanceListener());
 			return factory;
 		}
 
@@ -347,6 +394,8 @@ public class EnableKafkaIntegrationTests {
 
 		private final CountDownLatch latch7 = new CountDownLatch(1);
 
+		private final CountDownLatch eventLatch = new CountDownLatch(1);
+
 		private volatile Integer partition;
 
 		private volatile ConsumerRecord<?, ?> record;
@@ -358,6 +407,8 @@ public class EnableKafkaIntegrationTests {
 		private String topic;
 
 		private Foo foo;
+
+		private volatile ListenerContainerIdleEvent event;
 
 		@KafkaListener(id = "manualStart", topics = "manualStart",
 				containerFactory = "kafkaAutoStartFalseListenerContainerFactory")
@@ -392,6 +443,12 @@ public class EnableKafkaIntegrationTests {
 			this.ack = ack;
 			this.ack.acknowledge();
 			this.latch4.countDown();
+		}
+
+		@EventListener(condition = "event.listenerId.startsWith('qux')")
+		public void eventHandler(ListenerContainerIdleEvent event) {
+			this.event = event;
+			eventLatch.countDown();
 		}
 
 		@KafkaListener(id = "fiz", topicPartitions = {
@@ -435,7 +492,7 @@ public class EnableKafkaIntegrationTests {
 			latch1.countDown();
 		}
 
-		@KafkaListener(topics = "annotated9")
+		@KafkaListener(id = "ifctx", topics = "annotated9")
 		@Transactional
 		public void listenTx(String foo) {
 			latch2.countDown();
@@ -450,7 +507,7 @@ public class EnableKafkaIntegrationTests {
 		}
 	}
 
-	@KafkaListener(topics = "annotated8")
+	@KafkaListener(id = "multi", topics = "annotated8")
 	static class MultiListenerBean {
 
 		private final CountDownLatch latch1 = new CountDownLatch(1);
@@ -479,12 +536,12 @@ public class EnableKafkaIntegrationTests {
 
 	}
 
-	public static class DeDupImpl implements DeDuplicationStrategy<Integer, String> {
+	public static class RecordFilterImpl implements RecordFilterStrategy<Integer, String> {
 
 		private boolean called;
 
 		@Override
-		public boolean isDuplicate(ConsumerRecord<Integer, String> consumerRecord) {
+		public boolean filter(ConsumerRecord<Integer, String> consumerRecord) {
 			called = true;
 			return false;
 		}

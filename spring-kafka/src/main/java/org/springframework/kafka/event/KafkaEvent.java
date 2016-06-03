@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 the original author or authors.
+ * Copyright 2015-2016 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,27 +14,22 @@
  * limitations under the License.
  */
 
-package org.springframework.kafka.listener.adapter;
+package org.springframework.kafka.event;
 
-import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.context.ApplicationEvent;
+
 
 /**
- * Implementations of this interface can signal that a message about
- * to be delivered to a message listener is a duplicate.
- *
- * @param <K> the key type.
- * @param <V> the value type.
+ * Base class for events.
  *
  * @author Gary Russell
  *
  */
-public interface DeDuplicationStrategy<K, V> {
+@SuppressWarnings("serial")
+public abstract class KafkaEvent extends ApplicationEvent {
 
-	/**
-	 * Return true if the record is a duplicate and should be discarded.
-	 * @param consumerRecord the record.
-	 * @return true to discard.
-	 */
-	boolean isDuplicate(ConsumerRecord<K, V> consumerRecord);
+	public KafkaEvent(Object source) {
+		super(source);
+	}
 
 }

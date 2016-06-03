@@ -146,56 +146,50 @@ The following constructors are available.
 [source, java]
 ----
 public KafkaMessageListenerContainer(ConsumerFactory<K, V> consumerFactory,
-                                                        TopicPartition... topicPartitions)
+                                                        ContainerProperties containerProperties)
 
 public KafkaMessageListenerContainer(ConsumerFactory<K, V> consumerFactory,
-														ConsumerRebalanceListener consumerRebalanceListener,
-                                                        TopicPartition... topicPartitions)
+                        ContainerProperties containerProperties, TopicPartition... topicPartitions)
 
-public KafkaMessageListenerContainer(ConsumerFactory<K, V> consumerFactory, String... topics)
-
-public KafkaMessageListenerContainer(ConsumerFactory<K, V> consumerFactory,
-														ConsumerRebalanceListener consumerRebalanceListener,
-														String... topics)
-
-public KafkaMessageListenerContainer(ConsumerFactory<K, V> consumerFactory,
-                                                        Pattern topicPattern)
-
-public KafkaMessageListenerContainer(ConsumerFactory<K, V> consumerFactory,
-														ConsumerRebalanceListener consumerRebalanceListener,
-                                                        Pattern topicPattern)
 ----
 
-Each takes a `ConsumerFactory` and information about topics and partitions.
-
-The first takes a list of `TopicPartition` arguments to explicitly instruct the container which partitions to use
-(using the consumer `assign()` method).
-The third takes a list of topics and Kafka allocates the partitions based on the `group.id` property - distributing
-partitions across the group.
-The fifth is similar to the third, but uses a regex `Pattern` to select the topics.
-The second, forth and sixth constructors are similar to first, third and fifth respectively with additional
-user-provided `consumerRebalanceListener` implementation.
-
-====== ConcurrentMessageListenerContainer
-
-The constructors are similar to the `KafkaListenerContainer`:
+Each takes a `ConsumerFactory` and information about topics and partitions, as well as other configuration in a `ContainerProperties`
+object.
+The second constructor is used by the `ConcurrentMessageListenerContainer` (see below) to distribute `TopicPartitions` across the consumer instances.
+`ContainerProperties` has the following constructors:
 
 [source, java]
 ----
-public ConcurrentMessageListenerContainer(ConsumerFactory<K, V> consumerFactory, TopicPartition... topicPartitions)
+public ContainerProperties(TopicPartition... topicPartitions)
 
-public ConcurrentMessageListenerContainer(ConsumerFactory<K, V> consumerFactory, String... topics)
+public ContainerProperties(String... topics)
 
-public ConcurrentMessageListenerContainer(ConsumerFactory<K, V> consumerFactory, Pattern topicPattern)
+public ContainerProperties(Pattern topicPattern)
 ----
 
-It also has a property `concurrency`, e.g. `container.setConcurrency(3)` will create 3
-`KafkaMessageListenerContainer` s.
+The first takes an array of `TopicPartition` arguments to explicitly instruct the container which partitions to use
+(using the consumer `assign()` method).
+The second takes an array of topics and Kafka allocates the partitions based on the `group.id` property - distributing
+partitions across the group.
+The third uses a regex `Pattern` to select the topics.
 
-You can also configure rebalance listener by using `consumerRebalanceListener` property.
+Refer to the javadocs for `ContainerProperties` for more information about the various properties that can be set.
 
-For the second and third container, kafka will distribute the partitions across the consumers.
-For the first constructor, the `ConcurrentMessageListenerContainer` distributes the `TopicPartition` s across the
+====== ConcurrentMessageListenerContainer
+
+The single constructor is similar to the first `KafkaListenerContainer` constructor:
+
+[source, java]
+----
+public ConcurrentMessageListenerContainer(ConsumerFactory<K, V> consumerFactory,
+                                                ContainerProperties containerProperties)
+
+----
+
+It also has a property `concurrency`, e.g. `container.setConcurrency(3)` will create 3 `KafkaMessageListenerContainer` s.
+
+For the first constructor, kafka will distribute the partitions across the consumers.
+For the second constructor, the `ConcurrentMessageListenerContainer` distributes the `TopicPartition` s across the
 delegate `KafkaMessageListenerContainer` s.
 
 If, say, 6 `TopicPartition` s are provided and the `concurrency` is 3; each container will get 2 partitions.
@@ -234,13 +228,13 @@ NOTE: `MANUAL`, `MANUAL_IMMEDIATE`, and `MANUAL_IMMEDIATE_SYNC` require the list
 ----
 public interface AcknowledgingMessageListener<K, V> {
 
-	void onMessage(ConsumerRecord<K, V> record, Acknowledgment acknowledgment);
+    void onMessage(ConsumerRecord<K, V> record, Acknowledgment acknowledgment);
 
 }
 
 public interface Acknowledgment {
 
-	void acknowledge();
+    void acknowledge();
 
 }
 ----
@@ -275,6 +269,7 @@ KafkaListenerContainerFactory<ConcurrentMessageListenerContainer<Integer, String
                             new ConcurrentKafkaListenerContainerFactory<>();
     factory.setConsumerFactory(consumerFactory());
     factory.setConcurrency(3);
+    factory.getContainerProperties().setPollTimeout(3000);
     return factory;
 }
 
@@ -291,6 +286,9 @@ public Map<String, Object> consumerConfigs() {
     return props;
 }
 ----
+
+Notice that to set container properties, you must use the `getContainerProperties()` method on the factory.
+It is used as a template for the actual properties injected into the container.
 
 You can also configure POJO listeners with explicit topics and partitions:
 
@@ -331,25 +329,38 @@ public void listen(@Payload String foo,
 }
 ----
 
-===== Handling Duplicates
+===== Filtering Messages
 
 In certain scenarios, such as rebalancing, a message may be redelivered that has already been processed.
 The framework cannot know whether such a message has been processed or not, that is an application-level
 function.
 This is known as the http://www.enterpriseintegrationpatterns.com/patterns/messaging/IdempotentReceiver.html[Idempotent
 Receiver] pattern and Spring Integration provides an
-http://docs.spring.io/spring-integration/reference/html/messaging-endpoints-chapter.html#idempotent-receiver
-[implementation thereof].
+http://docs.spring.io/spring-integration/reference/html/messaging-endpoints-chapter.html#idempotent-receiver[implementation thereof].
 
-The Spring for Apache Kafka project also provides some assistance by means of the `DeDuplicatingMessageListenerAdapter`
-classe, which can wrap your `MessageListener`.
-This class takes an implementation of `DeDuplicationStrategy` where you implement the `isDuplicate` method to signal
+The Spring for Apache Kafka project also provides some assistance by means of the `FilteringMessageListenerAdapter`
+class, which can wrap your `MessageListener`.
+This class takes an implementation of `RecordFilterStrategy` where you implement the `filter` method to signal
 that a message is a duplicate and should be discarded.
 
-Similarly, when using `@KafkaListener`, the `DeDuplicationStrategy` can be injected into the container factory.
+A `FilteringAcknowledgingMessageListenerAdapter` is also provided for wrapping an `AcknowledgingMessageListener`.
+This has an additional property `ackDiscarded` which indicates whether the adapter should acknowledge the discarded record; it is `true` by default.
 
-A wrapper is not provided for the `AcknowledgingMessageListener` because you might need to acknowledge the duplicated
-message.
+When using `@KafkaListener`, set the `RecordFilterStrategy` (and optionally `ackDiscarded`) on the container factory and the listener will be wrapped in the appropriate filtering adapter.
+
+
+===== Retrying Deliveries
+
+If your listener throws an exception, the default behavior is to invoke the `ErrorHandler`, if configured, or logged otherwise.
+
+To retry deliveries, convenient listener adapters - `RetryingMessageListenerAdapter` and `RetryingAcknowledgingMessageListenerAdapter` are provided, depending on whether you are using a `MessageListener` or an `AcknowledgingMessageListener`.
+
+These can be configured with a `RetryTemplate` and `RecoveryCallback<Void>` - see the https://github.com/spring-projects/spring-retry[spring-retry]
+project for information about these components.
+If a recovery callback is not provided, the exception is thrown to the container after retries are exhausted.
+In that case, the `ErrorHandler` will be invoked, if configured, or logged otherwise.
+
+When using `@KafkaListener`, set the `RetryTemplate` (and optionally `recoveryCallback`) on the container factory and the listener will be wrapped in the appropriate retrying adapter.
 
 ==== Serialization/Deserialization and Message Conversion
 
@@ -411,3 +422,87 @@ public void jsonListener(Foo foo) {
 ...
 }
 ----
+
+[[idle-containers]]
+===== Detecting Idle Asynchronous Consumers
+
+While efficient, one problem with asynchronous consumers is detecting when they are idle - users might want to take
+some action if no messages arrive for some period of time.
+
+You can configure the listener container to publish a `ListenerContainerIdleEvent` when some time passes with no message delivery.
+While the container is idle, an event will be published every `idleEventInterval` milliseconds.
+
+To configure this feature, set the `idleEventInterval` on the container:
+
+[source, java]
+----
+@Bean
+public KafKaMessageListenerContainer(ConnectionFactory connectionFactory) {
+    ContainerProperties containerProps = new ContainerProperties("topic1", "topic2");
+    ...
+    containerProps.setIdleEventInterval(60000L);
+    ...
+    KafKaMessageListenerContainer<String, String> container = new KafKaMessageListenerContainer<>(...);
+    return container;
+}
+----
+
+Or, for a `@KafkaListener`...
+
+[source, java]
+----
+@Bean
+public ConcurrentKafkaListenerContainerFactory kafkaListenerContainerFactory() {
+    ConcurrentKafkaListenerContainerFactory<String, String> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+    ...
+    factory.getContainerProperties().setIdleEventInterval(60000L);
+    ...
+    return factory;
+}
+----
+
+In each of these cases, an event will be published once per minute while the container is idle.
+
+====== Event Consumption
+
+You can capture these events by implementing `ApplicationListener` - either a general listener, or one narrowed to only receive this specific event.
+You can also use `@EventListener`, introduced in Spring Framework 4.2.
+
+The following example combines the `@KafkaListener` and `@EventListener` into a single class.
+It's important to understand that the application listener will get events for all containers so you may need to
+check the listener id if you want to take specific action based on which container is idle.
+You can also use the `@EventListener` `condition` for this purpose.
+
+The events have 4 properties:
+
+- `source` - the listener container instance
+- `id` - the listener id (or container bean name)
+- `idleTime` - the time the container had been idle when the event was published
+- `topicPartitions` - the topics/partitions that the container was assigned at the time the event was generated
+
+[source, xml]
+----
+public class Listener {
+
+    @KafkaListener(id = "qux", topics = "annotated")
+    public void listen4(@Payload String foo, Acknowledgment ack) {
+        ...
+    }
+
+    @EventListener(condition = "event.listenerId.startsWith('qux-')")
+    public void eventHandler(ListenerContainerIdleEvent event) {
+        this.event = event;
+        eventLatch.countDown();
+    }
+
+}
+----
+
+IMPORTANT: Event listeners will see events for all containers; so, in the example above, we narrow the events received based on the listener ID.
+Since containers created for the `@KafkaListener` support concurrency, the actual containers are named `id-n` where the `n` is a unique value for each instance to support the concurrency.
+Hence we use `startsWith` in the condition.
+
+CAUTION: If you wish to use the idle event to stop the lister container, you should not call `container.stop()` on the thread that calls the listener - it will cause delays and unnecessary log messages.
+Instead, you should hand off the event to a different thread that can then stop the container.
+Also, you should not `stop()` the container instance in the event if it is a child container, you should stop the concurrent container instead.

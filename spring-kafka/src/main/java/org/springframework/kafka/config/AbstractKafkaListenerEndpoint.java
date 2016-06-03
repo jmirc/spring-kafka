@@ -31,10 +31,17 @@ import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.config.BeanExpressionContext;
 import org.springframework.beans.factory.config.BeanExpressionResolver;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.kafka.listener.AcknowledgingMessageListener;
 import org.springframework.kafka.listener.MessageListener;
 import org.springframework.kafka.listener.MessageListenerContainer;
-import org.springframework.kafka.listener.adapter.DeDuplicationStrategy;
+import org.springframework.kafka.listener.adapter.FilteringAcknowledgingMessageListenerAdapter;
+import org.springframework.kafka.listener.adapter.FilteringMessageListenerAdapter;
+import org.springframework.kafka.listener.adapter.RecordFilterStrategy;
+import org.springframework.kafka.listener.adapter.RetryingAcknowledgingMessageListenerAdapter;
+import org.springframework.kafka.listener.adapter.RetryingMessageListenerAdapter;
 import org.springframework.kafka.support.converter.MessageConverter;
+import org.springframework.retry.RecoveryCallback;
+import org.springframework.retry.support.RetryTemplate;
 import org.springframework.util.Assert;
 
 /**
@@ -68,8 +75,13 @@ public abstract class AbstractKafkaListenerEndpoint<K, V>
 
 	private String group;
 
-	private DeDuplicationStrategy<K, V> deDuplicationStrategy;
+	private RecordFilterStrategy<K, V> recordFilterStrategy;
 
+	private boolean ackDiscarded;
+
+	private RetryTemplate retryTemplate;
+
+	private RecoveryCallback<Void> recoveryCallback;
 
 	@Override
 	public void setBeanFactory(BeanFactory beanFactory) throws BeansException {
@@ -196,16 +208,54 @@ public abstract class AbstractKafkaListenerEndpoint<K, V>
 		}
 	}
 
-	protected DeDuplicationStrategy<K, V> getDeDuplicationStrategy() {
-		return this.deDuplicationStrategy;
+	protected RecordFilterStrategy<K, V> getRecordFilterStrategy() {
+		return this.recordFilterStrategy;
 	}
 
 	/**
-	 * Set a {@link DeDuplicationStrategy} implementation.
-	 * @param deDuplicationStrategy the strategy implementation.
+	 * Set a {@link RecordFilterStrategy} implementation.
+	 * @param recordFilterStrategy the strategy implementation.
 	 */
-	public void setDeDuplicationStrategy(DeDuplicationStrategy<K, V> deDuplicationStrategy) {
-		this.deDuplicationStrategy = deDuplicationStrategy;
+	public void setRecordFilterStrategy(RecordFilterStrategy<K, V> recordFilterStrategy) {
+		this.recordFilterStrategy = recordFilterStrategy;
+	}
+
+	protected boolean isAckDiscarded() {
+		return this.ackDiscarded;
+	}
+
+	/**
+	 * Set to true if the {@link #setRecordFilterStrategy(RecordFilterStrategy)
+	 * recordFilterStrategy} is in use.
+	 * @param ackDiscarded the ackDiscarded.
+	 */
+	public void setAckDiscarded(boolean ackDiscarded) {
+		this.ackDiscarded = ackDiscarded;
+	}
+
+	protected RetryTemplate getRetryTemplate() {
+		return this.retryTemplate;
+	}
+
+	/**
+	 * Set a retryTemplate.
+	 * @param retryTemplate the template.
+	 */
+	public void setRetryTemplate(RetryTemplate retryTemplate) {
+		this.retryTemplate = retryTemplate;
+	}
+
+	protected RecoveryCallback<?> getRecoveryCallback() {
+		return this.recoveryCallback;
+	}
+
+	/**
+	 * Set a callback to be used with the {@link #setRetryTemplate(RetryTemplate)
+	 * retryTemplate}.
+	 * @param recoveryCallback the callback.
+	 */
+	public void setRecoveryCallback(RecoveryCallback<Void> recoveryCallback) {
+		this.recoveryCallback = recoveryCallback;
 	}
 
 	@Override
@@ -223,9 +273,32 @@ public abstract class AbstractKafkaListenerEndpoint<K, V>
 	protected abstract MessageListener<K, V> createMessageListener(MessageListenerContainer container,
 			MessageConverter messageConverter);
 
+	@SuppressWarnings("unchecked")
 	private void setupMessageListener(MessageListenerContainer container, MessageConverter messageConverter) {
-		MessageListener<K, V> messageListener = createMessageListener(container, messageConverter);
+		Object messageListener = createMessageListener(container, messageConverter);
 		Assert.state(messageListener != null, "Endpoint [" + this + "] must provide a non null message listener");
+		if (this.retryTemplate != null) {
+			if (messageListener instanceof AcknowledgingMessageListener) {
+				messageListener = new RetryingAcknowledgingMessageListenerAdapter<>(
+						(AcknowledgingMessageListener<K, V>) messageListener, this.retryTemplate,
+						this.recoveryCallback);
+			}
+			else {
+				messageListener = new RetryingMessageListenerAdapter<>((MessageListener<K, V>) messageListener,
+						this.retryTemplate, this.recoveryCallback);
+			}
+		}
+		if (this.recordFilterStrategy != null) {
+			if (messageListener instanceof AcknowledgingMessageListener) {
+				messageListener = new FilteringAcknowledgingMessageListenerAdapter<>(
+						(AcknowledgingMessageListener<K, V>) messageListener, this.recordFilterStrategy,
+						this.ackDiscarded);
+			}
+			else {
+				messageListener = new FilteringMessageListenerAdapter<>((MessageListener<K, V>) messageListener,
+						this.recordFilterStrategy);
+			}
+		}
 		container.setupMessageListener(messageListener);
 	}
 
